@@ -23,21 +23,47 @@ cd hackerrank-orchestrate-october26
 
 Start your AI coding tool from the **repository root** so it automatically reads [`AGENTS.md`](./AGENTS.md) and logs your session turns to `log.txt` in the root directory.
 
-Build your solution in `code/main.py`, or use another language and document its setup and run command clearly in your README.
+The current Python implementation uses the repository-local Python 3.8 environment and local evidence extraction dependencies. From PowerShell, set it up and run:
 
-Your solution must:
-
-- Read the input files from `dataset/`
-- Generate one prediction row for every request in `dataset/deletion_requests.csv`
-- Write the final predictions to `output.csv` in the repository root
-
-Run the starter Python entry point with:
-
-```bash
-python3 code/main.py
+```powershell
+py -3.8 -m venv .venv-py38
+.\.venv-py38\Scripts\python.exe -m pip install -r code\requirements-evidence.txt
+$env:Path = "C:\Program Files\Tesseract-OCR;$env:Path"
+.\.venv-py38\Scripts\python.exe code\main.py
 ```
 
+On other platforms, use a local Python 3.8 environment, install `code/requirements-evidence.txt`, and ensure the local Tesseract executable and English language data are available on `PATH` before running `python code/main.py`.
+
+The runner builds one reusable evidence index for all requests and writes the root `output.csv` only when every request can be represented without converting unresolved evidence into a finding or completion claim. If its summary reports blocked requests, it exits non-zero and intentionally does not write a partial or misleading submission file; resolve the reported evidence gaps before submission.
+
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
+
+### Optional local PDF and image evidence extraction
+
+The evidence index uses PyPDF2 for text-based PDFs. To render scanned PDF pages and OCR PDFs or screenshots locally, install the pinned Python 3.8 dependencies:
+
+```powershell
+py -3.8 -m venv .venv-py38
+.\.venv-py38\Scripts\python.exe -m pip install -r code\requirements-evidence.txt
+where.exe tesseract
+```
+
+If Tesseract is not installed, install it locally:
+
+```powershell
+winget install --id UB-Mannheim.TesseractOCR -e
+```
+
+If it is installed but `where.exe tesseract` cannot find it, add its executable directory to the current PowerShell session (adjust the path if installed elsewhere):
+
+```powershell
+$env:Path = "C:\Program Files\Tesseract-OCR;$env:Path"
+tesseract --version
+```
+
+Tesseract and the English language data must be available on `PATH` to the process building the index. On other platforms, install the local Tesseract executable and English language data with the platform's package manager. No cloud OCR service is used.
+
+OCR-derived evidence is reported as `PARTIAL` with page or image-region provenance and remains inconclusive; review it against the source artifact. Missing OCR tools, unreadable files, or timestamp-less observations are not evidence that a record is absent.
 
 
 ## Dataset

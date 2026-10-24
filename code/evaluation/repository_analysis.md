@@ -58,7 +58,7 @@ All CSV files in `dataset/` were read as CSV files. Counts below are from the pa
 | `system_activity.csv` | 4,011 | `activity_id,event_time,event_type,source_system,target_system,resource_id,reported_result,details`. Activity IDs are unique; event times span 2026-01-04 through 2026-10-01 UTC. It covers 11 source and 19 target systems, with 17 event types. Largest groups include DELETE_RECORD (890), UPDATE_RECORD (672), SYNC_RECORD (447), INDEX_RECORD (400), SEND_EMAIL (368), and REFRESH_CACHE (284); it also includes export, retention, anonymization/redaction, data-flow checks/disablement, restore checks/blocking, and one RESTORE_BACKUP event. |
 | `deletion_rules.csv` | 15 | `rule_id,data_category,condition,required_action`; one row per category. Actions are DELETE (7), REDACT (3), ANONYMIZE (2), and RETAIN (3). |
 | `evidence_files.csv` | 94 | `file_id,file_path,origin,captured_at`. File IDs are unique. It maps evidence IDs to paths, origin labels, and capture times; it does not establish subject or case membership. Capture timestamps span 2026-01-29 through 2026-10-01 UTC. |
-| `dataset/output.csv` | 0 | The provided file is empty/headerless, despite being described as a blank template. The required output schema must therefore come from the written contract. |
+| `dataset/output.csv` | 0 | Header-only template with the required `case_id,deletion_status,steps_json` columns; the written contract remains authoritative for generated output. |
 
 ### Identity and time relationships
 
@@ -116,7 +116,7 @@ For an account tombstone, retain the stable `user_id` reference but remove direc
 
 ## 4. Existing Code, Dependencies, and Reusable Work
 
-- `code/main.py` exists but is empty (0 bytes). `code/evaluation/main.py` also exists but is empty (0 bytes). No implementation, test suite, or shared parser/helper was found under `code/`.
+- `code/main.py` and `code/evaluation/main.py` are empty starter entry points. The Phase 2 foundation now lives in `code/deletion_audit/` with typed input models, schema-aware CSV loading, exact current/historical email resolution, and cutoff filtering; focused `unittest` coverage lives in `code/tests/`. No complete decision engine, evidence-file parser, or output generator is implemented.
 - No dependency manifest was found in the repository root or under `code/`. The documented starter command is `python3 code/main.py`; Python's standard library provides CSV/JSON parsing, datetime handling, and SQLite support. PDF/OCR and image interpretation dependencies are not declared and must be selected and documented if used.
 - The current environment had Pillow and pandas installed, but neither is declared by the project. Do not rely on undeclared workstation packages for a clean run.
 - `README.md` documents the challenge, output requirements, run command, packaging, and says evaluation reports belong under `code/evaluation/`. `problem_statement.md` supplies the participant-facing rules, schema, and scoring requirements. `AGENTS.md` adds the project contract and transcript-logging requirements. `CLAUDE.md` points back to `AGENTS.md`; `agent_trace_instructions.md` covers packaging a separate trace ZIP.
