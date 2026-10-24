@@ -420,6 +420,75 @@ class DecisionEngineTests(unittest.TestCase):
             ],
         )
 
+    def test_restore_candidate_requires_correlated_successful_access_check(self):
+        backup = evidence(
+            "backup-candidate",
+            "BACKUP_ARCHIVE",
+            state=None,
+            inspection_status=InspectionStatus.INCONCLUSIVE,
+            attributes={
+                "event": "restore_candidate_evaluated",
+                "eligible": True,
+                "deletion_block": False,
+            },
+            system_id="backup_service",
+            resource_id="backup_3245",
+        )
+        uncorroborated = grounded_for((backup,))
+        uncorroborated_edge = next(
+            edge
+            for edge in build_recreation_graph(uncorroborated).edges
+            if edge.kind == RecreationEdgeKind.RESTORE
+        )
+        self.assertEqual(
+            uncorroborated_edge.risk_state, RecreationRiskState.UNKNOWN
+        )
+
+        restore_check = SystemActivity(
+            activity_id="activity-restore-check",
+            event_time=timestamp("2026-03-20T00:00:00Z"),
+            event_type="CHECK_RESTORE_ACCESS",
+            source_system="backup_service",
+            target_system="backup_service",
+            resource_id="backup_3245",
+            reported_result="SUCCESS",
+            details="Restore access remains available.",
+        )
+        grounded = grounded_for(
+            (backup,),
+            activities=(
+                GroundedActivity(
+                    activity=restore_check,
+                    kind=ActivityKind.RESTORE_RISK,
+                    temporal_disposition=TemporalDisposition.ELIGIBLE,
+                    system_id="backup_service",
+                    resource_id="backup_3245",
+                    supporting_evidence_ids=("backup-candidate",),
+                    attribution_source="INDEXED_SUBJECT_RECORD",
+                ),
+            ),
+        )
+        edge = next(
+            edge
+            for edge in build_recreation_graph(grounded).edges
+            if edge.kind == RecreationEdgeKind.RESTORE
+            and edge.evidence_ids == ("backup-candidate",)
+        )
+        self.assertEqual(edge.risk_state, RecreationRiskState.ACTIVE)
+        decision = decide_request(
+            make_request(),
+            classify_request("Please delete my account"),
+            grounded,
+            policy_for(
+                grounded,
+                (deletion_rule("BACKUP_ARCHIVE", "RETAIN"),),
+            ),
+            build_recreation_graph(grounded),
+        )
+        self.assertEqual(decision.status, DeletionStatus.INCOMPLETE)
+        self.assertEqual(decision.steps[0]["operation"], "REPORT_RESTORE_RISK")
+        self.assertEqual(decision.steps[0]["evidence_id"], "backup-candidate")
+
     def test_recreation_graph_preserves_activity_edges_as_unknown(self):
         event = SystemActivity(
             activity_id="activity-sync",

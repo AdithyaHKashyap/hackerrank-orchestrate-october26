@@ -11,6 +11,8 @@ from .evidence_index import (
     FileExtractionReport,
     IndexedEvidence,
     TemporalEvidencePartition,
+    _normalize_indexed_identifier,
+    _reference_identifier_type,
 )
 from .identity_links import IdentityLink, IdentityLinkConfidence
 from .models import DeletionRequest, EvidenceFact, InspectionStatus
@@ -146,9 +148,9 @@ def reconcile_request(
 ) -> RequestCoverageLedger:
     """Build a conservative ledger without treating coverage gaps as absence.
 
-    Subject associations use only explicit stable-user-reference fields or
-    typed email/phone/hash fields supplied by the caller. Name and free-text
-    matches are intentionally excluded.
+    Subject associations use only explicit stable-user-reference fields,
+    typed email/phone/hash fields, or sibling events sharing a trace ID in the
+    same source file. Name and free-text matches are intentionally excluded.
     """
 
     identifiers = _normalize_subject_identifiers(subject_identifiers or {})
@@ -160,11 +162,29 @@ def reconcile_request(
             identifiers.setdefault(link.identifier_type.value, set()).add(
                 link.normalized_value
             )
-    related_records = tuple(
+    direct_related_records = tuple(
         record
-        for record in evidence_index.records
+        for record in evidence_index.for_subject(
+            subject_user_id, identifiers
+        )
         if _record_matches_subject(record, subject_user_id, identifiers)
     )
+    eligible_anchors = _partition_records(
+        direct_related_records, request.audit_at
+    ).eligible
+    trace_contexts = {
+        (record.source_path, trace_id)
+        for record in eligible_anchors
+        for trace_id in _record_trace_ids(record)
+    }
+    # Evidence IDs identify files; multiple records from one file share the ID.
+    related_record_map = {
+        id(record): record for record in direct_related_records
+    }
+    for source_path, trace_id in trace_contexts:
+        for record in evidence_index.for_source_trace(source_path, trace_id):
+            related_record_map[id(record)] = record
+    related_records = evidence_index.ordered_subset(related_record_map.values())
     temporal = _partition_records(related_records, request.audit_at)
     eligible = tuple(
         _observation(record, TemporalDisposition.ELIGIBLE)
@@ -271,13 +291,7 @@ def _normalize_subject_identifiers(
 
 
 def _normalize_identifier(identifier_type: str, value: str) -> str:
-    text = value.strip()
-    if identifier_type == "email":
-        return text.casefold()
-    if identifier_type == "phone":
-        digits = "".join(character for character in text if character.isdigit())
-        return ("+" if text.startswith("+") else "") + digits
-    return text.casefold()
+    return _normalize_indexed_identifier(identifier_type, value)
 
 
 def _record_matches_subject(
@@ -301,14 +315,18 @@ def _record_matches_subject(
         if not isinstance(value, str):
             continue
         normalized_key = key.strip().casefold()
-        if normalized_key == "subject_reference":
-            reference = value.strip()
-            if subject_user_id and reference == subject_user_id:
-                return True
-            if (
-                "@" in reference
-                and _normalize_identifier("email", reference)
-                in identifiers.get("email", set())
+        if normalized_key == "lookup_key" and (
+            record.metadata.get("readback_export_complete") is not True
+        ):
+            continue
+        if normalized_key in {
+            "subject_reference",
+            "subject_key",
+            "lookup_key",
+            "correlation_key",
+        }:
+            if _matches_subject_reference(
+                value, subject_user_id, identifiers
             ):
                 return True
             continue
@@ -328,6 +346,33 @@ def _record_matches_subject(
         ):
             return True
     return False
+
+
+def _record_trace_ids(record: IndexedEvidence) -> Tuple[str, ...]:
+    return tuple(
+        value.strip()
+        for key, value in record.attributes.items()
+        if key.strip().casefold() == "trace_id"
+        and isinstance(value, str)
+        and value.strip()
+    )
+
+
+def _matches_subject_reference(
+    value: str,
+    subject_user_id: Optional[str],
+    identifiers: Mapping[str, set],
+) -> bool:
+    reference = value.strip()
+    if subject_user_id and reference == subject_user_id:
+        return True
+    identifier_type = _reference_identifier_type(reference)
+    if identifier_type is None:
+        return False
+    return (
+        _normalize_identifier(identifier_type, reference)
+        in identifiers.get(identifier_type, set())
+    )
 
 
 def _partition_records(
@@ -475,7 +520,9 @@ def _resource_coverage(
             else set()
         )
         sufficient_absence = any(
-            item.evidence_id in complete_ids for item in absent
+            item.evidence_id in complete_ids
+            or item.record.metadata.get("complete_scoped_inspection") is True
+            for item in absent
         )
         status = (
             CoverageStatus.CONFIRMED_ABSENT

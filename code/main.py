@@ -44,6 +44,8 @@ class DatasetRunSummary:
     evidence_file_status_counts: Mapping[str, int]
     evidence_record_count: int
     temporally_unresolved_record_count: int
+    evidence_cache_hits: int
+    evidence_cache_misses: int
     output_path: Optional[Path]
     output_valid: Optional[bool]
     sample_status_accuracy: Optional[float]
@@ -69,7 +71,8 @@ def run_dataset(
     else:
         requests = inputs.requests
 
-    raw_index = EvidenceIndex.build(dataset_dir)
+    evidence_cache = Path(__file__).resolve().parents[0] / ".cache" / "evidence-index"
+    raw_index = EvidenceIndex.build(dataset_dir, cache_dir=evidence_cache)
     evidence_index = normalize_evidence_index(raw_index)
     identity_resolver = build_identity_link_resolver(
         inputs.identities, inputs.identity_events, evidence_index
@@ -82,7 +85,7 @@ def run_dataset(
     )
 
     decisions = []
-    sample_diagnostics = []
+    diagnostics = []
     policy_counts = Counter()
     category_counts = Counter()
     unknown_reasons = Counter()
@@ -137,8 +140,8 @@ def run_dataset(
             request, classification, grounded, assessment, graph
         )
         decisions.append(decision)
-        if sample_only and decision.status is None:
-            sample_diagnostics.append(
+        if decision.status is None:
+            diagnostics.append(
                 _case_diagnostic(
                     request,
                     classification,
@@ -186,7 +189,7 @@ def run_dataset(
             / "evaluation"
             / "sample_case_diagnostics.csv"
         )
-        _write_sample_diagnostics(diagnostics_path, sample_diagnostics)
+        _write_case_diagnostics(diagnostics_path, diagnostics)
         sample_score = _score_public_sample(
             written_path,
             dataset_dir,
@@ -214,26 +217,33 @@ def run_dataset(
             ],
             "diagnostics_path": str(diagnostics_path),
         }
-    elif not blocked:
-        written_path = _write_and_validate(
-            decisions, output_path, dataset_dir
+    else:
+        diagnostics_path = (
+            Path(__file__).resolve().parent
+            / "evaluation"
+            / "full_case_diagnostics.csv"
         )
-        output_valid = True
-        sample_requests = load_requests(dataset_dir / "sample_deletion_requests.csv")
-        sample_score = _score_public_sample(
-            written_path,
-            dataset_dir,
-            sample_requests,
-        )
-        sample_status_accuracy = sample_score.status_accuracy
-        sample_metrics = {
-            "case_count": sample_score.case_count,
-            "status_accuracy": sample_score.status_accuracy,
-            "field_accuracy": sample_score.field_accuracy,
-            "step_accuracy": sample_score.step_accuracy,
-            "sequence_accuracy": sample_score.sequence_accuracy,
-            "validation_is_valid": sample_score.validation.is_valid,
-        }
+        _write_case_diagnostics(diagnostics_path, diagnostics)
+        if not blocked:
+            written_path = _write_and_validate(
+                decisions, output_path, dataset_dir
+            )
+            output_valid = True
+            sample_requests = load_requests(dataset_dir / "sample_deletion_requests.csv")
+            sample_score = _score_public_sample(
+                written_path,
+                dataset_dir,
+                sample_requests,
+            )
+            sample_status_accuracy = sample_score.status_accuracy
+            sample_metrics = {
+                "case_count": sample_score.case_count,
+                "status_accuracy": sample_score.status_accuracy,
+                "field_accuracy": sample_score.field_accuracy,
+                "step_accuracy": sample_score.step_accuracy,
+                "sequence_accuracy": sample_score.sequence_accuracy,
+                "validation_is_valid": sample_score.validation.is_valid,
+            }
 
     return DatasetRunSummary(
         request_count=len(requests),
@@ -252,6 +262,8 @@ def run_dataset(
         evidence_file_status_counts=dict(sorted(evidence_status_counts.items())),
         evidence_record_count=len(evidence_index.records),
         temporally_unresolved_record_count=unresolved_record_count,
+        evidence_cache_hits=evidence_index.cache_hits,
+        evidence_cache_misses=evidence_index.cache_misses,
         output_path=written_path,
         output_valid=output_valid,
         sample_status_accuracy=sample_status_accuracy,
@@ -524,7 +536,7 @@ def _case_diagnostic(
     }
 
 
-def _write_sample_diagnostics(path: Path, diagnostics) -> Path:
+def _write_case_diagnostics(path: Path, diagnostics) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as destination:
         fieldnames = (
@@ -673,6 +685,8 @@ def main() -> int:
                 "temporally_unresolved_record_count": (
                     summary.temporally_unresolved_record_count
                 ),
+                "evidence_cache_hits": summary.evidence_cache_hits,
+                "evidence_cache_misses": summary.evidence_cache_misses,
                 "output_path": (
                     str(summary.output_path) if summary.output_path else None
                 ),

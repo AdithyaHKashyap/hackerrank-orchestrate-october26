@@ -1,15 +1,21 @@
 """Deterministic, provenance-preserving adapters for structured evidence."""
 
 import csv
+import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
-from dataclasses import dataclass
+import sys
+import tempfile
+from dataclasses import dataclass, replace
 from enum import Enum
+from functools import cached_property
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -48,11 +54,11 @@ class IndexedEvidence:
             return TemporalResolution.UNRESOLVED
         return TemporalResolution.RESOLVED
 
-    @property
+    @cached_property
     def attributes(self) -> Mapping[str, Any]:
         return json.loads(self.attributes_json)
 
-    @property
+    @cached_property
     def metadata(self) -> Mapping[str, Any]:
         return json.loads(self.metadata_json)
 
@@ -85,17 +91,27 @@ class EvidenceIndex:
         self,
         records: Iterable[IndexedEvidence],
         report: Iterable[FileExtractionReport],
+        cache_hits: int = 0,
+        cache_misses: int = 0,
     ) -> None:
         self.records = tuple(
             sorted(records, key=lambda record: (record.evidence_id, record.fact.provenance.record_locator or ""))
         )
         self.report = tuple(sorted(report, key=lambda item: item.evidence_id))
+        self.cache_hits = cache_hits
+        self.cache_misses = cache_misses
         by_id: Dict[str, List[IndexedEvidence]] = {}
         by_resource_id: Dict[str, List[IndexedEvidence]] = {}
         by_system_resource: Dict[Tuple[str, str], List[IndexedEvidence]] = {}
         by_identifier: Dict[Tuple[str, str], List[IndexedEvidence]] = {}
         by_identifier_value: Dict[str, List[IndexedEvidence]] = {}
+        by_subject_id: Dict[str, List[IndexedEvidence]] = {}
+        by_subject_identifier: Dict[Tuple[str, str], List[IndexedEvidence]] = {}
+        by_subject_reference: Dict[Tuple[str, str], List[IndexedEvidence]] = {}
+        by_source_trace: Dict[Tuple[str, str], List[IndexedEvidence]] = {}
+        self._record_positions = {}
         for record in self.records:
+            self._record_positions[id(record)] = len(self._record_positions)
             by_id.setdefault(record.evidence_id, []).append(record)
             if record.fact.resource_id is not None:
                 by_resource_id.setdefault(record.fact.resource_id, []).append(record)
@@ -108,6 +124,68 @@ class EvidenceIndex:
                     record
                 )
                 by_identifier_value.setdefault(value, []).append(record)
+            if record.fact.subject_user_id:
+                by_subject_id.setdefault(record.fact.subject_user_id, []).append(
+                    record
+                )
+            attributes = record.attributes
+            metadata = record.metadata
+            for key, value in attributes.items():
+                normalized_key = key.strip().casefold()
+                if (
+                    normalized_key
+                    in {
+                        "user_id",
+                        "subject_user_id",
+                        "customer_reference",
+                        "customer_id",
+                    }
+                    and isinstance(value, (str, int))
+                    and not isinstance(value, bool)
+                ):
+                    by_subject_id.setdefault(str(value).strip(), []).append(record)
+                if not isinstance(value, str):
+                    continue
+                if normalized_key in {"subject_reference", "subject_key", "correlation_key", "lookup_key"}:
+                    if normalized_key != "lookup_key" or metadata.get(
+                        "readback_export_complete"
+                    ) is True:
+                        by_subject_id.setdefault(value.strip(), []).append(record)
+                        reference_type = _reference_identifier_type(value)
+                        if reference_type:
+                            by_subject_reference.setdefault(
+                                (
+                                    reference_type,
+                                    _normalize_indexed_identifier(
+                                        reference_type, value
+                                    ),
+                                ),
+                                [],
+                            ).append(record)
+                else:
+                    identifier_type = next(
+                        (
+                            item_type
+                            for item_type in ("email", "phone", "email_hash")
+                            if normalized_key == item_type
+                            or normalized_key.endswith("_" + item_type)
+                        ),
+                        None,
+                    )
+                    if identifier_type:
+                        by_subject_identifier.setdefault(
+                            (
+                                identifier_type,
+                                _normalize_indexed_identifier(
+                                    identifier_type, value
+                                ),
+                            ),
+                            [],
+                        ).append(record)
+                if normalized_key == "trace_id" and value.strip():
+                    by_source_trace.setdefault(
+                        (record.source_path, value.strip()), []
+                    ).append(record)
         self._by_evidence_id = {
             evidence_id: tuple(items) for evidence_id, items in by_id.items()
         }
@@ -124,19 +202,52 @@ class EvidenceIndex:
         self._by_identifier_value = {
             value: tuple(items) for value, items in by_identifier_value.items()
         }
+        self._by_subject_id = {
+            value: tuple(items) for value, items in by_subject_id.items()
+        }
+        self._by_subject_identifier = {
+            key: tuple(items) for key, items in by_subject_identifier.items()
+        }
+        self._by_subject_reference = {
+            key: tuple(items) for key, items in by_subject_reference.items()
+        }
+        self._by_source_trace = {
+            key: tuple(items) for key, items in by_source_trace.items()
+        }
 
     @classmethod
-    def build(cls, dataset_dir: Path) -> "EvidenceIndex":
+    def build(
+        cls, dataset_dir: Path, cache_dir: Optional[Path] = None
+    ) -> "EvidenceIndex":
         dataset_dir = Path(dataset_dir).resolve()
         manifest_path = dataset_dir / "evidence_files.csv"
         files = _load_manifest(manifest_path)
         records: List[IndexedEvidence] = []
         reports: List[FileExtractionReport] = []
+        cache_hits = 0
+        cache_misses = 0
+        extraction_signature = (
+            _extraction_signature() if cache_dir is not None else None
+        )
         for evidence_file in files:
-            file_records, file_report = _extract_file(dataset_dir, evidence_file)
+            if cache_dir is None:
+                file_records, file_report = _extract_file(
+                    dataset_dir, evidence_file
+                )
+            else:
+                file_records, file_report, cache_hit = _extract_cached_file(
+                    dataset_dir,
+                    evidence_file,
+                    Path(cache_dir),
+                    extraction_signature,
+                )
+                if cache_hit:
+                    cache_hits += 1
+                else:
+                    cache_misses += 1
             records.extend(file_records)
             reports.append(file_report)
-        return cls(records, reports)
+        return cls(records, reports, cache_hits, cache_misses)
 
     def for_evidence(self, evidence_id: str) -> Tuple[IndexedEvidence, ...]:
         return self._by_evidence_id.get(evidence_id, tuple())
@@ -156,13 +267,51 @@ class EvidenceIndex:
             return self._by_identifier.get(
                 (identifier_type.casefold(), value), tuple()
             )
-        return tuple(
-            sorted(
-                set(self._by_identifier_value.get(value, tuple())),
-                key=lambda record: (
-                    record.evidence_id,
-                    record.fact.provenance.record_locator or "",
-                ),
+            return tuple(
+                sorted(
+                    set(self._by_identifier_value.get(value, tuple())),
+                    key=lambda record: (
+                        record.evidence_id,
+                        record.fact.provenance.record_locator or "",
+                    ),
+                )
+            )
+
+    def for_subject(
+            self,
+            subject_user_id: Optional[str],
+            identifiers: Mapping[str, Iterable[str]],
+    ) -> Tuple[IndexedEvidence, ...]:
+            candidates: Dict[int, IndexedEvidence] = {}
+            if subject_user_id:
+                for record in self._by_subject_id.get(subject_user_id, tuple()):
+                    candidates[id(record)] = record
+            for identifier_type, values in identifiers.items():
+                for value in values:
+                    key = (identifier_type, value)
+                    for record in self._by_subject_identifier.get(key, tuple()):
+                        candidates[id(record)] = record
+                    for record in self._by_subject_reference.get(key, tuple()):
+                        candidates[id(record)] = record
+            return self._ordered_subset(candidates)
+
+    def for_source_trace(
+            self, source_path: str, trace_id: str
+    ) -> Tuple[IndexedEvidence, ...]:
+            return self._by_source_trace.get((source_path, trace_id), tuple())
+
+    def ordered_subset(
+            self, records: Iterable[IndexedEvidence]
+    ) -> Tuple[IndexedEvidence, ...]:
+            return self._ordered_subset({id(record): record for record in records})
+
+    def _ordered_subset(
+            self, records: Mapping[int, IndexedEvidence]
+    ) -> Tuple[IndexedEvidence, ...]:
+            return tuple(
+                sorted(
+                    records.values(),
+                    key=lambda record: self._record_positions[id(record)],
             )
         )
 
@@ -264,6 +413,49 @@ _SQL_CAPTURED_AT = re.compile(
 )
 _HANDOVER_SNAPSHOT = re.compile(r"^\s*Snapshot:\s*(.*?)\s*$", re.IGNORECASE)
 _HANDOVER_ROW = re.compile(r"^\s*-\s*(.*?)\s*$")
+_READBACK_EVENT_PAIRS = {
+    ("account_service", "profile_lookup_started"): "profile_lookup_completed",
+    ("analytics_platform", "analytics_profile_read_started"): "analytics_profile_read_completed",
+    ("backup_service", "restore_policy_read_started"): "restore_policy_read_completed",
+    ("export_service", "export_metadata_read_started"): "export_metadata_read_completed",
+    ("integration_service", "connector_config_read_started"): "connector_config_read_completed",
+    ("search_service", "index_query_started"): "index_query_completed",
+    ("security_service", "audit_record_read_started"): "audit_record_read_completed",
+    ("support_platform", "support_ticket_read_started"): "support_ticket_read_completed",
+}
+_CACHE_FORMAT_VERSION = 1
+_CACHE_SOURCE_FILES = (
+    Path(__file__),
+    Path(__file__).with_name("models.py"),
+    Path(__file__).with_name("temporal.py"),
+    Path(__file__).with_name("csv_loader.py"),
+)
+_CACHE_DEPENDENCIES = (
+    "Pillow",
+    "PyPDF2",
+    "pypdf",
+    "pypdfium2",
+    "pytesseract",
+)
+
+
+def _normalize_indexed_identifier(identifier_type: str, value: str) -> str:
+    text = value.strip()
+    if identifier_type == "phone":
+        digits = "".join(character for character in text if character.isdigit())
+        return ("+" if text.startswith("+") else "") + digits
+    return text.casefold()
+
+
+def _reference_identifier_type(value: str) -> Optional[str]:
+    reference = value.strip()
+    if "@" in reference:
+        return "email"
+    if re.fullmatch(r"[0-9a-fA-F]{64}", reference):
+        return "email_hash"
+    if re.fullmatch(r"\+?[\d\s().-]{7,}", reference):
+        return "phone"
+    return None
 
 
 def _load_manifest(path: Path) -> Tuple[EvidenceFile, ...]:
@@ -281,6 +473,335 @@ def _load_manifest(path: Path) -> Tuple[EvidenceFile, ...]:
             )
         )
     return _unique(files, lambda item: item.file_id, str(path))
+
+
+def _extraction_signature() -> str:
+    sources = {}
+    for path in _CACHE_SOURCE_FILES:
+        sources[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    dependencies = {}
+    for package in _CACHE_DEPENDENCIES:
+        try:
+            dependencies[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            dependencies[package] = None
+
+    ocr = _optional_module("pytesseract")
+    ocr_backend = {
+        "module_available": ocr is not None,
+        "command": None,
+        "version": None,
+        "executable_path": None,
+        "executable_sha256": None,
+        "tessdata_prefix": os.environ.get("TESSDATA_PREFIX"),
+        "language_data_sha256": {},
+    }
+    if ocr is not None:
+        command = str(
+            getattr(getattr(ocr, "pytesseract", None), "tesseract_cmd", "tesseract")
+        )
+        ocr_backend["command"] = command
+        try:
+            ocr_backend["version"] = str(ocr.get_tesseract_version())
+        except (OSError, RuntimeError) as error:
+            ocr_backend["version"] = "unavailable:{}".format(error)
+        executable = shutil.which(command)
+        if executable:
+            executable_path = Path(executable).resolve()
+            ocr_backend["executable_path"] = str(executable_path)
+            try:
+                ocr_backend["executable_sha256"] = hashlib.sha256(
+                    executable_path.read_bytes()
+                ).hexdigest()
+            except OSError as error:
+                ocr_backend["executable_sha256"] = "unavailable:{}".format(
+                    error
+                )
+            tessdata_paths = {
+                executable_path.parent / "tessdata" / "eng.traineddata"
+            }
+            configured_prefix = os.environ.get("TESSDATA_PREFIX")
+            if configured_prefix:
+                configured_path = Path(configured_prefix)
+                tessdata_paths.add(configured_path / "eng.traineddata")
+                tessdata_paths.add(
+                    configured_path / "tessdata" / "eng.traineddata"
+                )
+            language_data = {}
+            for path in sorted(tessdata_paths):
+                if path.is_file():
+                    try:
+                        language_data[str(path.resolve())] = hashlib.sha256(
+                            path.read_bytes()
+                        ).hexdigest()
+                    except OSError as error:
+                        language_data[str(path.resolve())] = (
+                            "unavailable:{}".format(error)
+                        )
+            ocr_backend["language_data_sha256"] = language_data
+
+    return json.dumps(
+        {
+            "python": tuple(sys.version_info[:3]),
+            "source_sha256": sources,
+            "dependencies": dependencies,
+            "ocr": ocr_backend,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _cache_fingerprint(
+    dataset_dir: Path,
+    evidence_file: EvidenceFile,
+    extraction_signature: str,
+) -> Optional[str]:
+    digest = hashlib.sha256()
+    digest.update(extraction_signature.encode("utf-8"))
+    digest.update(
+        json.dumps(
+            (
+                evidence_file.file_id,
+                evidence_file.file_path,
+                evidence_file.origin,
+                evidence_file.captured_at.isoformat(),
+            ),
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    try:
+        path = _safe_evidence_path(dataset_dir, evidence_file.file_path)
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        digest.update(b"<missing>")
+    except (OSError, ValueError):
+        return None
+    return digest.hexdigest()
+
+
+def _extract_cached_file(
+    dataset_dir: Path,
+    evidence_file: EvidenceFile,
+    cache_dir: Path,
+    extraction_signature: Optional[str],
+) -> Tuple[List[IndexedEvidence], FileExtractionReport, bool]:
+    if extraction_signature is None:
+        return _extract_file(dataset_dir, evidence_file) + (False,)
+    fingerprint = _cache_fingerprint(
+        dataset_dir, evidence_file, extraction_signature
+    )
+    if fingerprint is None:
+        return _extract_file(dataset_dir, evidence_file) + (False,)
+
+    cache_name = hashlib.sha256(
+        evidence_file.file_id.encode("utf-8")
+    ).hexdigest() + ".json"
+    cache_path = cache_dir / cache_name
+    if cache_path.is_file():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                payload.get("cache_format") == _CACHE_FORMAT_VERSION
+                and payload.get("fingerprint") == fingerprint
+            ):
+                cached_records = [
+                    _record_from_cache(item) for item in payload["records"]
+                ]
+                cached_report = _report_from_cache(payload["report"])
+                if (
+                    cached_report.evidence_id == evidence_file.file_id
+                    and cached_report.source_path == evidence_file.file_path
+                    and cached_report.source_origin == evidence_file.origin
+                    and cached_report.captured_at
+                    == evidence_file.captured_at.isoformat()
+                    and len(cached_records) == cached_report.record_count
+                    and all(
+                        record.evidence_id == evidence_file.file_id
+                        and record.source_path == evidence_file.file_path
+                        and record.source_origin == evidence_file.origin
+                        for record in cached_records
+                    )
+                ):
+                    return cached_records, cached_report, True
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            IndexError,
+        ) as error:
+            print(
+                "warning: invalid evidence cache for {}: {}; re-extracting".format(
+                    evidence_file.file_id, error
+                ),
+                file=sys.stderr,
+            )
+
+    extracted_records, report = _extract_file(dataset_dir, evidence_file)
+    _write_file_cache(
+        cache_path,
+        fingerprint,
+        extracted_records,
+        report,
+    )
+    return extracted_records, report, False
+
+
+def _record_to_cache(record: IndexedEvidence) -> Dict[str, Any]:
+    fact = record.fact
+    provenance = fact.provenance
+    return {
+        "evidence_id": record.evidence_id,
+        "source_path": record.source_path,
+        "source_origin": record.source_origin,
+        "extraction_method": record.extraction_method,
+        "attributes_json": record.attributes_json,
+        "metadata_json": record.metadata_json,
+        "identifiers": record.identifiers,
+        "timestamp_fields": record.timestamp_fields,
+        "fact": {
+            "system_id": fact.system_id,
+            "resource_id": fact.resource_id,
+            "data_category": fact.data_category,
+            "observed_state": fact.observed_state,
+            "inspection_status": fact.inspection_status.value,
+            "subject_user_id": fact.subject_user_id,
+            "observed_at": (
+                fact.observed_at.isoformat() if fact.observed_at else None
+            ),
+            "provenance": {
+                "source_type": provenance.source_type,
+                "source_id": provenance.source_id,
+                "source_path": provenance.source_path,
+                "record_locator": provenance.record_locator,
+                "available_at": (
+                    provenance.available_at.isoformat()
+                    if provenance.available_at
+                    else None
+                ),
+            },
+        },
+    }
+
+
+def _record_from_cache(payload: Mapping[str, Any]) -> IndexedEvidence:
+    fact = payload["fact"]
+    provenance = fact["provenance"]
+    return IndexedEvidence(
+        evidence_id=payload["evidence_id"],
+        source_path=payload["source_path"],
+        source_origin=payload["source_origin"],
+        extraction_method=payload["extraction_method"],
+        fact=EvidenceFact(
+            system_id=fact["system_id"],
+            resource_id=fact["resource_id"],
+            data_category=fact["data_category"],
+            observed_state=fact["observed_state"],
+            inspection_status=InspectionStatus(fact["inspection_status"]),
+            provenance=Provenance(
+                source_type=provenance["source_type"],
+                source_id=provenance["source_id"],
+                source_path=provenance["source_path"],
+                record_locator=provenance["record_locator"],
+                available_at=(
+                    parse_timestamp(provenance["available_at"], "cache available_at")
+                    if provenance["available_at"]
+                    else None
+                ),
+            ),
+            subject_user_id=fact["subject_user_id"],
+            observed_at=(
+                parse_timestamp(fact["observed_at"], "cache observed_at")
+                if fact["observed_at"]
+                else None
+            ),
+        ),
+        attributes_json=payload["attributes_json"],
+        metadata_json=payload["metadata_json"],
+        identifiers=tuple(tuple(item) for item in payload["identifiers"]),
+        timestamp_fields=tuple(tuple(item) for item in payload["timestamp_fields"]),
+    )
+
+
+def _report_to_cache(report: FileExtractionReport) -> Dict[str, Any]:
+    return {
+        "evidence_id": report.evidence_id,
+        "source_path": report.source_path,
+        "source_origin": report.source_origin,
+        "captured_at": report.captured_at,
+        "status": report.status.value,
+        "extraction_method": report.extraction_method,
+        "record_count": report.record_count,
+        "temporally_unresolved_count": report.temporally_unresolved_count,
+        "warnings": report.warnings,
+        "error": report.error,
+    }
+
+
+def _report_from_cache(payload: Mapping[str, Any]) -> FileExtractionReport:
+    return FileExtractionReport(
+        evidence_id=payload["evidence_id"],
+        source_path=payload["source_path"],
+        source_origin=payload["source_origin"],
+        captured_at=payload["captured_at"],
+        status=ExtractionStatus(payload["status"]),
+        extraction_method=payload["extraction_method"],
+        record_count=int(payload["record_count"]),
+        temporally_unresolved_count=int(payload["temporally_unresolved_count"]),
+        warnings=tuple(payload["warnings"]),
+        error=payload["error"],
+    )
+
+
+def _write_file_cache(
+    cache_path: Path,
+    fingerprint: str,
+    records: Sequence[IndexedEvidence],
+    report: FileExtractionReport,
+) -> None:
+    temporary_path = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".evidence-cache-", suffix=".tmp", dir=str(cache_path.parent)
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(
+                {
+                    "cache_format": _CACHE_FORMAT_VERSION,
+                    "fingerprint": fingerprint,
+                    "records": [_record_to_cache(record) for record in records],
+                    "report": _report_to_cache(report),
+                },
+                output,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        os.replace(str(temporary_path), str(cache_path))
+    except (OSError, TypeError, ValueError) as error:
+        print(
+            "warning: could not write evidence cache {}: {}".format(
+                cache_path, error
+            ),
+            file=sys.stderr,
+        )
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError as error:
+                print(
+                    "warning: could not remove temporary evidence cache {}: {}".format(
+                        temporary_path, error
+                    ),
+                    file=sys.stderr,
+                )
 
 
 def _safe_evidence_path(dataset_dir: Path, file_path: str) -> Path:
@@ -1091,7 +1612,216 @@ def _extract_log(
         )
         records.append(record)
         warnings.extend(record_warnings)
+    records = _correlate_service_readback(records, evidence_file)
     return records, warnings
+
+
+def _correlate_service_readback(
+    records: List[IndexedEvidence], evidence_file: EvidenceFile
+) -> List[IndexedEvidence]:
+    if evidence_file.origin != "service_readback_logs":
+        return records
+
+    attributes_by_record = [dict(record.attributes) for record in records]
+    export_starts = [
+        (record, attributes)
+        for record, attributes in zip(records, attributes_by_record)
+        if attributes.get("service") == "readback_collector"
+        and attributes.get("event") == "export_started"
+    ]
+    export_completions = [
+        (record, attributes)
+        for record, attributes in zip(records, attributes_by_record)
+        if attributes.get("service") == "readback_collector"
+        and attributes.get("event") == "export_completed"
+    ]
+    if len(export_starts) != 1 or len(export_completions) != 1:
+        return records
+
+    export_start, start_attributes = export_starts[0]
+    export_completion, completion_attributes = export_completions[0]
+    try:
+        target_count = int(start_attributes.get("target_count", ""))
+        completed_count = int(completion_attributes.get("queries", ""))
+        dropped_count = int(completion_attributes.get("dropped", ""))
+    except (TypeError, ValueError):
+        return records
+    if (
+        target_count <= 0
+        or completed_count != target_count
+        or dropped_count != 0
+        or str(start_attributes.get("mode", "")).casefold() != "point_in_time"
+        or export_start.fact.observed_at is None
+        or export_completion.fact.observed_at is None
+        or export_completion.fact.observed_at < export_start.fact.observed_at
+    ):
+        return records
+
+    starts = {}
+    completions = {}
+    for record, attributes in zip(records, attributes_by_record):
+        service = str(attributes.get("service", "")).casefold()
+        event = str(attributes.get("event", "")).casefold()
+        trace_id = attributes.get("trace_id")
+        resource_id = attributes.get("resource_id")
+        if not trace_id or not resource_id:
+            continue
+        event_key = (service, event)
+        if event_key in _READBACK_EVENT_PAIRS:
+            key = (service, str(trace_id), str(resource_id))
+            starts.setdefault(key, []).append((record, attributes))
+        elif event_key in {
+            (service, completed_event)
+            for (paired_service, _), completed_event in _READBACK_EVENT_PAIRS.items()
+            if paired_service == service
+        }:
+            key = (service, str(trace_id), str(resource_id))
+            completions.setdefault(key, []).append((record, attributes))
+
+    if (
+        len(starts) != target_count
+        or len(completions) != target_count
+        or any(len(items) != 1 for items in starts.values())
+        or any(len(items) != 1 for items in completions.values())
+        or set(starts) != set(completions)
+    ):
+        return records
+    if any(
+        record.fact.observed_at is None
+        or record.fact.observed_at < export_start.fact.observed_at
+        or record.fact.observed_at > export_completion.fact.observed_at
+        for pair in tuple(starts.values()) + tuple(completions.values())
+        for record, _ in pair
+    ):
+        return records
+
+    records_by_locator = {
+        record.fact.provenance.record_locator: record for record in records
+    }
+    for key, ((start_record, start_values),) in starts.items():
+        (completed_record, completed_values) = completions[key][0]
+        if completed_values.get("event") != _READBACK_EVENT_PAIRS[
+            (key[0], str(start_values.get("event", "")).casefold())
+        ]:
+            return records
+        merged_attributes = dict(completed_values)
+        lookup_key = start_values.get("lookup_key")
+        if lookup_key is not None:
+            merged_attributes.setdefault("lookup_key", lookup_key)
+        state = _readback_observed_state(key[0], str(completed_values.get("event", "")).casefold(), merged_attributes)
+        metadata = dict(completed_record.metadata)
+        metadata["readback_export_complete"] = True
+        metadata["correlated_record_locators"] = [
+            start_record.fact.provenance.record_locator
+        ]
+        if state is not None:
+            metadata["complete_scoped_inspection"] = True
+        fact = completed_record.fact
+        if state is not None:
+            fact = replace(
+                fact,
+                observed_state=state,
+                inspection_status=InspectionStatus.CONFIRMED,
+            )
+        records_by_locator[completed_record.fact.provenance.record_locator] = replace(
+            completed_record,
+            fact=fact,
+            attributes_json=_canonical_json(merged_attributes),
+            metadata_json=_canonical_json(metadata),
+            identifiers=tuple(
+                sorted(
+                    set(completed_record.identifiers)
+                    | (
+                        {("lookup_key", str(lookup_key))}
+                        if lookup_key is not None
+                        else set()
+                    )
+                )
+            ),
+        )
+    return [
+        records_by_locator.get(
+            record.fact.provenance.record_locator, record
+        )
+        for record in records
+    ]
+
+
+def _readback_observed_state(
+    service: str, event: str, attributes: Mapping[str, Any]
+) -> Optional[str]:
+    if service == "account_service" and event == "profile_lookup_completed":
+        try:
+            rows = int(attributes.get("rows", ""))
+            http_status = int(attributes.get("http_status", ""))
+        except (TypeError, ValueError):
+            return None
+        if rows == 0 and http_status == 404:
+            return "ABSENT"
+        if rows > 0 and 200 <= http_status < 300:
+            return "PRESENT"
+        return None
+    if service == "security_service" and event == "audit_record_read_completed":
+        try:
+            rows = int(attributes.get("rows", ""))
+        except (TypeError, ValueError):
+            return None
+        if rows > 0:
+            return "PRESENT"
+        if rows == 0:
+            return "ABSENT"
+        return None
+    if service == "search_service" and event == "index_query_completed":
+        result = str(attributes.get("result", "")).strip().casefold()
+        try:
+            hits = int(attributes.get("total_hits", ""))
+        except (TypeError, ValueError):
+            return None
+        if result == "hit" and hits > 0:
+            return "PRESENT"
+        if result == "miss" and hits == 0:
+            return "ABSENT"
+        return None
+    if service == "backup_service" and event == "restore_policy_read_completed":
+        if _readback_boolean(attributes.get("archive_present")) is True:
+            return "PRESENT"
+        return None
+    if service == "integration_service" and event == "connector_config_read_completed":
+        if _readback_boolean(attributes.get("enabled")) is not None:
+            return "PRESENT"
+        return None
+    if service == "analytics_platform" and event == "analytics_profile_read_completed":
+        if "audience_cohort" in attributes:
+            return "PRESENT"
+        return None
+    if service == "support_platform" and event == "support_ticket_read_completed":
+        if any(
+            key in attributes
+            for key in (
+                "customer_reference",
+                "requester_email",
+                "requester_name",
+                "requester_phone",
+            )
+        ):
+            return "PRESENT"
+        return None
+    if service == "export_service" and event == "export_metadata_read_completed":
+        if _readback_boolean(attributes.get("available")) is True:
+            return "PRESENT"
+        return None
+    return None
+
+
+def _readback_boolean(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().casefold()
+    if normalized in {"true", "1", "yes", "enabled", "active"}:
+        return True
+    if normalized in {"false", "0", "no", "disabled", "inactive"}:
+        return False
+    return None
 
 
 def _pipe_log_fields(line: str) -> Dict[str, str]:

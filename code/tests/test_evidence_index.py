@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import deletion_audit.evidence_index as evidence_index
 from deletion_audit.evidence_index import (
     EvidenceIndex,
     ExtractionStatus,
@@ -20,7 +21,7 @@ class EvidenceIndexTests(unittest.TestCase):
         self.dataset_dir = Path(self.temporary_directory.name)
         (self.dataset_dir / "evidence").mkdir()
 
-    def write_fixture(self, entries):
+    def write_fixture(self, entries, origin="test_fixture"):
         manifest_path = self.dataset_dir / "evidence_files.csv"
         with manifest_path.open("w", encoding="utf-8", newline="") as output:
             writer = csv.writer(output)
@@ -30,7 +31,7 @@ class EvidenceIndexTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
                 writer.writerow(
-                    (evidence_id, relative_path, "test_fixture", captured_at)
+                    (evidence_id, relative_path, origin, captured_at)
                 )
 
     def test_adapts_json_sql_and_log_with_provenance(self):
@@ -166,6 +167,183 @@ COMMIT;
             1,
         )
 
+    def test_cached_build_reuses_extraction_and_invalidates_changed_input(self):
+        self.write_fixture(
+            [
+                (
+                    "cached-json",
+                    "evidence/cache.json",
+                    '{"records":[{"resource_id":"profile_1","email":"person@example.test"}]}',
+                    "2026-09-01T00:00:00Z",
+                )
+            ]
+        )
+        cache_dir = self.dataset_dir / "cache"
+        first = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        self.assertEqual((first.cache_hits, first.cache_misses), (0, 1))
+        with patch(
+            "deletion_audit.evidence_index._extract_file",
+            side_effect=AssertionError("cached extraction should not run"),
+        ):
+            second = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        self.assertEqual((second.cache_hits, second.cache_misses), (1, 0))
+        self.assertEqual(first.records, second.records)
+        self.assertEqual(first.report, second.report)
+
+        cache_file = next(cache_dir.glob("*.json"))
+        cache_payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        cache_payload["records"][0]["source_path"] = "evidence/unrelated.json"
+        cache_file.write_text(json.dumps(cache_payload), encoding="utf-8")
+        with patch(
+            "deletion_audit.evidence_index._extract_file",
+            wraps=evidence_index._extract_file,
+        ) as extract_file:
+            corrupted = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        self.assertEqual((corrupted.cache_hits, corrupted.cache_misses), (0, 1))
+        extract_file.assert_called_once()
+
+        evidence_path = self.dataset_dir / "evidence" / "cache.json"
+        evidence_path.write_text(
+            '{"records":[{"resource_id":"profile_2","email":"person@example.test"}]}',
+            encoding="utf-8",
+        )
+        changed = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        self.assertEqual((changed.cache_hits, changed.cache_misses), (0, 1))
+        self.assertEqual(changed.records[0].fact.resource_id, "profile_2")
+
+    def test_cached_attributes_and_metadata_are_parsed_once(self):
+        self.write_fixture(
+            [
+                (
+                    "cached-property",
+                    "evidence/record.json",
+                    '{"resource_id":"profile_1","email":"person@example.test"}',
+                    "2026-09-01T00:00:00Z",
+                )
+            ]
+        )
+
+        with patch(
+            "deletion_audit.evidence_index.json.loads",
+            wraps=json.loads,
+        ) as loads:
+            record = EvidenceIndex.build(self.dataset_dir).records[0]
+            parse_count = loads.call_count
+            first_attributes = record.attributes
+            self.assertIs(record.attributes, first_attributes)
+            first_metadata = record.metadata
+            self.assertIs(record.metadata, first_metadata)
+            self.assertEqual(loads.call_count, parse_count)
+        self.assertEqual(parse_count, 3)
+
+    def test_cached_build_invalidates_changed_extraction_signature(self):
+        self.write_fixture(
+            [
+                (
+                    "signature-json",
+                    "evidence/signature.json",
+                    '{"records":[{"resource_id":"profile_1"}]}',
+                    "2026-09-01T00:00:00Z",
+                )
+            ]
+        )
+        cache_dir = self.dataset_dir / "cache"
+        with patch(
+            "deletion_audit.evidence_index._extraction_signature",
+            return_value="extractor-v1",
+        ):
+            first = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        self.assertEqual((first.cache_hits, first.cache_misses), (0, 1))
+
+        with patch(
+            "deletion_audit.evidence_index._extraction_signature",
+            return_value="extractor-v2",
+        ), patch(
+            "deletion_audit.evidence_index._extract_file",
+            wraps=evidence_index._extract_file,
+        ) as extract_file:
+            second = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        self.assertEqual((second.cache_hits, second.cache_misses), (0, 1))
+        extract_file.assert_called_once()
+
+    def test_cached_raw_evidence_is_filtered_against_each_audit_cutoff(self):
+        self.write_fixture(
+            [
+                (
+                    "cutoff-json",
+                    "evidence/cutoff.json",
+                    (
+                        '{"snapshots":[{"captured_at":"2026-09-02T00:00:00Z",'
+                        '"records":[{"resource_id":"profile_1",'
+                        '"email":"person@example.test"}]}]}'
+                    ),
+                    "2026-09-03T00:00:00Z",
+                )
+            ]
+        )
+        cache_dir = self.dataset_dir / "cache"
+        first = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        before_available = first.at_cutoff(
+            datetime(2026, 9, 2, tzinfo=timezone.utc)
+        )
+        self.assertEqual(
+            [
+                record.fact.resource_id
+                for record in before_available.excluded
+                if record.fact.resource_id == "profile_1"
+            ],
+            ["profile_1"],
+        )
+
+        second = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        at_available = second.at_cutoff(
+            datetime(2026, 9, 3, tzinfo=timezone.utc)
+        )
+        self.assertEqual((second.cache_hits, second.cache_misses), (1, 0))
+        self.assertEqual(
+            [
+                record.fact.resource_id
+                for record in at_available.eligible
+                if record.fact.resource_id == "profile_1"
+            ],
+            ["profile_1"],
+        )
+
+    def test_cached_build_invalidates_manifest_metadata_changes(self):
+        self.write_fixture(
+            [
+                (
+                    "manifest-json",
+                    "evidence/manifest.json",
+                    '{"records":[{"resource_id":"profile_1"}]}',
+                    "2026-09-01T00:00:00Z",
+                )
+            ],
+            origin="origin-before",
+        )
+        cache_dir = self.dataset_dir / "cache"
+        first = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+        self.assertEqual((first.cache_hits, first.cache_misses), (0, 1))
+
+        self.write_fixture(
+            [
+                (
+                    "manifest-json",
+                    "evidence/manifest.json",
+                    '{"records":[{"resource_id":"profile_1"}]}',
+                    "2026-09-02T00:00:00Z",
+                )
+            ],
+            origin="origin-after",
+        )
+        second = EvidenceIndex.build(self.dataset_dir, cache_dir=cache_dir)
+
+        self.assertEqual((second.cache_hits, second.cache_misses), (0, 1))
+        self.assertEqual(second.report[0].source_origin, "origin-after")
+        self.assertEqual(
+            second.report[0].captured_at, "2026-09-02T00:00:00+00:00"
+        )
+
     def test_pipe_delimited_log_preserves_positional_service_and_event(self):
         self.write_fixture(
             [
@@ -194,6 +372,105 @@ COMMIT;
         self.assertEqual(record.fact.observed_at, datetime(2026, 9, 3, tzinfo=timezone.utc))
         self.assertEqual(record.fact.inspection_status.value, "INCONCLUSIVE")
         self.assertIsNone(record.fact.observed_state)
+
+    def test_complete_service_readback_correlates_exact_lookup_and_resource_state(self):
+        self.write_fixture(
+            [
+                (
+                    "readback",
+                    "evidence/resource_lookup_trace.log",
+                    "\n".join(
+                        (
+                            "2026-09-03T00:00:00Z level=INFO service=readback_collector event=export_started target_count=1 mode=point_in_time",
+                            "2026-09-03T00:00:01Z level=DEBUG service=account_service trace_id=t-1 event=profile_lookup_started resource_id=account_1 lookup_key=person@example.test",
+                            "2026-09-03T00:00:02Z level=INFO service=account_service trace_id=t-1 event=profile_lookup_completed resource_id=account_1 rows=0 http_status=404",
+                            "2026-09-03T00:00:03Z level=INFO service=readback_collector event=export_completed queries=1 dropped=0",
+                        )
+                    )
+                    + "\n",
+                    "2026-09-03T00:00:04Z",
+                )
+            ],
+            origin="service_readback_logs",
+        )
+
+        index = EvidenceIndex.build(self.dataset_dir)
+        record = next(
+            item
+            for item in index.for_evidence("readback")
+            if item.attributes.get("event") == "profile_lookup_completed"
+        )
+
+        self.assertEqual(record.fact.observed_state, "ABSENT")
+        self.assertEqual(record.fact.inspection_status.value, "CONFIRMED")
+        self.assertEqual(record.attributes["lookup_key"], "person@example.test")
+        self.assertTrue(record.metadata["complete_scoped_inspection"])
+        self.assertEqual(
+            record.metadata["correlated_record_locators"], ["line=2"]
+        )
+
+    def test_service_readback_confirms_returned_security_record(self):
+        self.write_fixture(
+            [
+                (
+                    "readback",
+                    "evidence/resource_lookup_trace.log",
+                    "\n".join(
+                        (
+                            "2026-09-03T00:00:00Z level=INFO service=readback_collector event=export_started target_count=1 mode=point_in_time",
+                            "2026-09-03T00:00:01Z level=DEBUG service=security_service trace_id=t-1 event=audit_record_read_started resource_id=audit_1 lookup_key=user_1",
+                            "2026-09-03T00:00:02Z level=INFO service=security_service trace_id=t-1 event=audit_record_read_completed resource_id=audit_1 rows=1 subject_reference=user_1 retention_until=2034-09-30T23:59:59Z",
+                            "2026-09-03T00:00:03Z level=INFO service=readback_collector event=export_completed queries=1 dropped=0",
+                        )
+                    )
+                    + "\n",
+                    "2026-09-03T00:00:04Z",
+                )
+            ],
+            origin="service_readback_logs",
+        )
+
+        index = EvidenceIndex.build(self.dataset_dir)
+        record = next(
+            item
+            for item in index.for_evidence("readback")
+            if item.attributes.get("event") == "audit_record_read_completed"
+        )
+
+        self.assertEqual(record.fact.observed_state, "PRESENT")
+        self.assertEqual(record.fact.inspection_status.value, "CONFIRMED")
+        self.assertEqual(record.attributes["retention_until"], "2034-09-30T23:59:59Z")
+
+    def test_incomplete_service_readback_does_not_confirm_resource_state(self):
+        self.write_fixture(
+            [
+                (
+                    "readback",
+                    "evidence/resource_lookup_trace.log",
+                    "\n".join(
+                        (
+                            "2026-09-03T00:00:00Z level=INFO service=readback_collector event=export_started target_count=1 mode=point_in_time",
+                            "2026-09-03T00:00:01Z level=DEBUG service=account_service trace_id=t-1 event=profile_lookup_started resource_id=account_1 lookup_key=person@example.test",
+                            "2026-09-03T00:00:02Z level=INFO service=account_service trace_id=t-1 event=profile_lookup_completed resource_id=account_1 rows=0 http_status=404",
+                        )
+                    )
+                    + "\n",
+                    "2026-09-03T00:00:04Z",
+                )
+            ],
+            origin="service_readback_logs",
+        )
+
+        index = EvidenceIndex.build(self.dataset_dir)
+        record = next(
+            item
+            for item in index.for_evidence("readback")
+            if item.attributes.get("event") == "profile_lookup_completed"
+        )
+
+        self.assertIsNone(record.fact.observed_state)
+        self.assertEqual(record.fact.inspection_status.value, "INCONCLUSIVE")
+        self.assertNotIn("complete_scoped_inspection", record.metadata)
 
     def test_cutoff_excludes_later_capture_and_later_observation(self):
         self.write_fixture(

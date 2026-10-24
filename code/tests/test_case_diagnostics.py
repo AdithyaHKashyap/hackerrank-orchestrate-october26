@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from deletion_audit.evidence_index import ExtractionStatus
-from main import _case_diagnostic, _write_sample_diagnostics
+from main import _case_diagnostic, _write_case_diagnostics
 
 
 class CaseDiagnosticTests(unittest.TestCase):
@@ -104,7 +104,7 @@ class CaseDiagnosticTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "diagnostics.csv"
-            _write_sample_diagnostics(path, [diagnostic])
+            _write_case_diagnostics(path, [diagnostic])
             with path.open(encoding="utf-8", newline="") as source:
                 rows = list(csv.DictReader(source))
 

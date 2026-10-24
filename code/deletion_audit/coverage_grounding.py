@@ -131,7 +131,7 @@ _COLLECTION_CONTRACTS: Mapping[str, str] = {
     "customer_export_jobs": "USER_EXPORT",
     "marketing_profiles": "MARKETING_PROFILE",
     "secondary_identifiers": "SECONDARY_IDENTIFIER",
-    "deleted_customer_references": "SECONDARY_IDENTIFIER",
+    "deleted_customer_references": "ACCOUNT_TOMBSTONE",
     "cache_entries": "CACHE_ENTRY",
     "email_delivery_logs": "EMAIL_DELIVERY_LOG",
     "security_audit_events": "SECURITY_AUDIT_LOG",
@@ -393,7 +393,12 @@ def normalize_evidence_index(evidence_index: EvidenceIndex) -> EvidenceIndex:
                 identifiers=tuple(sorted(identifiers)),
             )
         )
-    return EvidenceIndex(normalized, evidence_index.report)
+    return EvidenceIndex(
+        normalized,
+        evidence_index.report,
+        cache_hits=evidence_index.cache_hits,
+        cache_misses=evidence_index.cache_misses,
+    )
 
 
 def derive_snapshot_contracts(
@@ -667,7 +672,12 @@ def _index_with_activity_system_links(
         ):
             record = replace(record, fact=replace(fact, system_id=system_id))
         updated_records.append(record)
-    return EvidenceIndex(updated_records, evidence_index.report)
+    return EvidenceIndex(
+        updated_records,
+        evidence_index.report,
+        cache_hits=evidence_index.cache_hits,
+        cache_misses=evidence_index.cache_misses,
+    )
 
 
 def _expected_scopes(

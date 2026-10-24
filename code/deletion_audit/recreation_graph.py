@@ -182,10 +182,29 @@ def build_recreation_graph(
             continue
         field = "enabled" if is_connector else "restore_allowed"
         enabled = _explicit_boolean(attributes, field)
+        corroborated_restore_candidate = (
+            is_backup
+            and _restore_candidate_is_unblocked(attributes)
+            and any(
+                activity.kind == ActivityKind.RESTORE_RISK
+                and activity.temporal_disposition == TemporalDisposition.ELIGIBLE
+                and activity.activity.event_type == "CHECK_RESTORE_ACCESS"
+                and activity.activity.reported_result == "SUCCESS"
+                and activity.system_id == fact.system_id
+                and activity.resource_id == fact.resource_id
+                and record.evidence_id in activity.supporting_evidence_ids
+                for activity in grounded.activity
+            )
+        )
         state = (
             RecreationRiskState.ACTIVE
-            if enabled is True
-            and fact.inspection_status.value == "CONFIRMED"
+            if (
+                (
+                    enabled is True
+                    and fact.inspection_status.value == "CONFIRMED"
+                )
+                or corroborated_restore_candidate
+            )
             else RecreationRiskState.INACTIVE
             if enabled is False
             and fact.inspection_status.value == "CONFIRMED"
@@ -329,3 +348,12 @@ def _explicit_boolean(attributes, key: str) -> Optional[bool]:
         if text in {"0", "false", "no", "disabled", "blocked", "inactive"}:
             return False
     return None
+
+
+def _restore_candidate_is_unblocked(attributes) -> bool:
+    event = str(attributes.get("event", "")).strip().casefold()
+    return (
+        event == "restore_candidate_evaluated"
+        and _explicit_boolean(attributes, "eligible") is True
+        and _explicit_boolean(attributes, "deletion_block") is False
+    )

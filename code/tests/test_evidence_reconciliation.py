@@ -19,6 +19,7 @@ from deletion_audit.evidence_reconciliation import (
     InspectionSourceStatus,
     ObservationKind,
     TemporalDisposition,
+    _record_matches_subject,
     reconcile_request,
 )
 from deletion_audit.models import (
@@ -55,10 +56,13 @@ def record(
     inspection_status=InspectionStatus.INCONCLUSIVE,
     extraction_method="json-object-path",
     locator="$.records[0]",
+    metadata=None,
+    source_path=None,
 ):
+    source_path = source_path or "evidence/{}.json".format(evidence_id)
     return IndexedEvidence(
         evidence_id=evidence_id,
-        source_path="evidence/{}.json".format(evidence_id),
+        source_path=source_path,
         source_origin="test",
         extraction_method=extraction_method,
         fact=EvidenceFact(
@@ -70,7 +74,7 @@ def record(
             provenance=Provenance(
                 source_type="EVIDENCE_FILE",
                 source_id=evidence_id,
-                source_path="evidence/{}.json".format(evidence_id),
+                source_path=source_path,
                 record_locator=locator,
                 available_at=timestamp(available_at) if available_at else None,
             ),
@@ -78,7 +82,7 @@ def record(
             observed_at=timestamp(observed_at) if observed_at else None,
         ),
         attributes_json=json.dumps(attributes, sort_keys=True),
-        metadata_json="{}",
+        metadata_json=json.dumps(metadata or {}, sort_keys=True),
         identifiers=tuple(),
         timestamp_fields=tuple(),
     )
@@ -114,6 +118,47 @@ def build_index(*records, report_statuses=None):
 
 
 class EvidenceReconciliationTests(unittest.TestCase):
+    def test_subject_index_is_a_complete_candidate_superset_of_exact_matching(self):
+        email_hash = "a" * 64
+        records = (
+            record("stable-id", {"user_id": "user-1"}),
+            record("customer-ref", {"customer_reference": "user-1"}),
+            record("typed-email", {"requester_email": "PERSON@example.test"}),
+            record("typed-phone", {"phone": "+1 (555) 123-4567"}),
+            record("typed-hash", {"email_hash": email_hash}),
+            record(
+                "reference-email",
+                {"subject_key": "Person@Example.Test"},
+            ),
+            record(
+                "complete-lookup",
+                {"lookup_key": "person@example.test"},
+                metadata={"readback_export_complete": True},
+            ),
+            record("incomplete-lookup", {"lookup_key": "person@example.test"}),
+            record("unrelated-email", {"email": "other@example.test"}),
+        )
+        index = EvidenceIndex(records, ())
+        identifiers = {
+            "email": {"person@example.test"},
+            "phone": {"+15551234567"},
+            "email_hash": {email_hash},
+        }
+
+        candidates = index.for_subject("user-1", identifiers)
+        actual_matches = {
+            id(item)
+            for item in candidates
+            if _record_matches_subject(item, "user-1", identifiers)
+        }
+        expected_matches = {
+            id(item)
+            for item in index.records
+            if _record_matches_subject(item, "user-1", identifiers)
+        }
+
+        self.assertEqual(actual_matches, expected_matches)
+
     def test_cutoff_boundary_and_temporal_uncertainty_are_preserved(self):
         exact = record(
             "exact",
@@ -281,6 +326,190 @@ class EvidenceReconciliationTests(unittest.TestCase):
 
         self.assertEqual(incomplete.groups[0].status, CoverageStatus.INCONCLUSIVE)
         self.assertEqual(complete.groups[0].status, CoverageStatus.CONFIRMED_ABSENT)
+
+    def test_complete_scoped_readback_can_prove_absence_for_exact_lookup_key(self):
+        absent = record(
+            "readback",
+            {
+                "lookup_key": "person@example.test",
+                "system_id": "account_service",
+                "resource_id": "account_1",
+                "data_category": "USER_PROFILE",
+            },
+            observed_state="ABSENT",
+            inspection_status=InspectionStatus.CONFIRMED,
+            metadata={
+                "complete_scoped_inspection": True,
+                "readback_export_complete": True,
+            },
+        )
+
+        ledger = reconcile_request(
+            request(),
+            build_index(absent),
+            subject_identifiers={"email": ("person@example.test",)},
+        )
+
+        self.assertEqual(
+            [item.evidence_id for item in ledger.eligible], ["readback"]
+        )
+        self.assertEqual(
+            ledger.groups[0].status, CoverageStatus.CONFIRMED_ABSENT
+        )
+
+    def test_unverified_lookup_key_does_not_link_a_resource_to_the_subject(self):
+        unrelated_lookup = record(
+            "unverified-readback",
+            {
+                "lookup_key": "person@example.test",
+                "system_id": "account_service",
+                "resource_id": "account_1",
+                "data_category": "USER_PROFILE",
+            },
+            observed_state="PRESENT",
+            inspection_status=InspectionStatus.CONFIRMED,
+        )
+
+        ledger = reconcile_request(
+            request(),
+            build_index(unrelated_lookup),
+            subject_identifiers={"email": ("person@example.test",)},
+        )
+
+        self.assertEqual(ledger.eligible, ())
+        self.assertEqual(ledger.groups, ())
+
+    def test_correlation_key_links_only_an_exact_stable_user_reference(self):
+        exact_link = record(
+            "exact-correlation",
+            {
+                "correlation_key": "user-1",
+                "system_id": "backup_service",
+                "resource_id": "backup_1",
+                "data_category": "BACKUP_ARCHIVE",
+            },
+        )
+        unrelated = record(
+            "unrelated-correlation",
+            {
+                "correlation_key": "trace-1",
+                "system_id": "backup_service",
+                "resource_id": "backup_2",
+                "data_category": "BACKUP_ARCHIVE",
+            },
+        )
+
+        ledger = reconcile_request(
+            request(),
+            build_index(exact_link, unrelated),
+            subject_user_id="user-1",
+        )
+
+        self.assertEqual(
+            [item.evidence_id for item in ledger.eligible],
+            ["exact-correlation"],
+        )
+
+    def test_subject_key_trace_links_sibling_events_within_same_source_file(self):
+        source_path = "evidence/logs/service-events.log"
+        anchor = record(
+            "evidence-log",
+            {
+                "subject_key": "person@example.test",
+                "trace_id": "trace-1",
+                "system_id": "backup_service",
+            },
+            locator="$.events[0]",
+            source_path=source_path,
+        )
+        sibling = record(
+            "evidence-log",
+            {
+                "trace_id": "trace-1",
+                "system_id": "backup_service",
+                "resource_id": "backup-1",
+                "data_category": "BACKUP_ARCHIVE",
+            },
+            locator="$.events[1]",
+            source_path=source_path,
+        )
+        unrelated_sibling = record(
+            "evidence-log",
+            {
+                "trace_id": "trace-2",
+                "system_id": "backup_service",
+                "resource_id": "backup-2",
+                "data_category": "BACKUP_ARCHIVE",
+            },
+            locator="$.events[2]",
+            source_path=source_path,
+        )
+        other_file = record(
+            "other-evidence",
+            {
+                "trace_id": "trace-1",
+                "system_id": "backup_service",
+                "resource_id": "backup-2",
+                "data_category": "BACKUP_ARCHIVE",
+            },
+            source_path="evidence/logs/other-service-events.log",
+        )
+
+        ledger = reconcile_request(
+            request(),
+            build_index(anchor, sibling, unrelated_sibling, other_file),
+            subject_user_id="user-1",
+            subject_identifiers={"email": ["person@example.test"]},
+        )
+
+        self.assertEqual(
+            {
+                item.record.fact.provenance.record_locator
+                for item in ledger.eligible
+            },
+            {"$.events[0]", "$.events[1]"},
+        )
+
+    def test_post_cutoff_subject_anchor_cannot_link_trace_siblings(self):
+        source_path = "evidence/logs/service-events.log"
+        post_cutoff_anchor = record(
+            "evidence-log",
+            {
+                "subject_key": "person@example.test",
+                "trace_id": "trace-1",
+            },
+            observed_at="2026-04-01T00:00:00.000001Z",
+            available_at="2026-04-01T00:00:00.000001Z",
+            locator="$.events[0]",
+            source_path=source_path,
+        )
+        sibling = record(
+            "evidence-log",
+            {
+                "trace_id": "trace-1",
+                "system_id": "backup_service",
+                "resource_id": "backup-1",
+                "data_category": "BACKUP_ARCHIVE",
+            },
+            locator="$.events[1]",
+            source_path=source_path,
+        )
+
+        ledger = reconcile_request(
+            request(),
+            build_index(post_cutoff_anchor, sibling),
+            subject_user_id="user-1",
+            subject_identifiers={"email": ["person@example.test"]},
+        )
+
+        self.assertEqual(ledger.eligible, ())
+        self.assertEqual(
+            [
+                item.record.fact.provenance.record_locator
+                for item in ledger.excluded
+            ],
+            ["$.events[0]"],
+        )
 
     def test_partial_snapshot_cannot_satisfy_complete_source_declaration(self):
         absent = record(

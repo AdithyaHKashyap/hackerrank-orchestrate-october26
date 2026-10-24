@@ -3,3 +3,4 @@
 __pycache__/
 *.py[cod]
 code/evaluation/sample_predictions.csv
+code/.cache/

@@ -144,6 +144,47 @@ def identity_resolver(*emails):
 
 
 class CoverageGroundingTests(unittest.TestCase):
+    def test_normalization_preserves_evidence_cache_metrics(self):
+        index = EvidenceIndex([], [], cache_hits=3, cache_misses=2)
+
+        normalized = normalize_evidence_index(index)
+
+        self.assertEqual(normalized.cache_hits, 3)
+        self.assertEqual(normalized.cache_misses, 2)
+
+    def test_deleted_customer_references_map_to_account_tombstones(self):
+        record = evidence_record(
+            evidence_id="tombstone",
+            attributes={
+                "collection": "deleted_customer_references",
+                "data_store": "identity_service",
+                "resource_id": "tombstone_1",
+                "user_id": "user_1",
+                "account_status": "DELETED",
+                "name": None,
+                "email": None,
+                "phone": None,
+                "email_hash": None,
+            },
+            metadata={"snapshot_record": True},
+        )
+        index = EvidenceIndex(
+            (record,),
+            (
+                report(
+                    evidence_id="tombstone",
+                    source_path="evidence/tombstone.json",
+                ),
+            ),
+        )
+
+        normalized = normalize_evidence_index(index)
+        tombstone = normalized.records[0]
+
+        self.assertEqual(tombstone.fact.system_id, "identity_service")
+        self.assertEqual(tombstone.fact.data_category, "ACCOUNT_TOMBSTONE")
+        self.assertTrue(tombstone.fact.confirms_presence)
+
     def test_service_export_schema_links_nested_rows_and_inherits_observation_time(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             dataset_dir = Path(temp_dir)
